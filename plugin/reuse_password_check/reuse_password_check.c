@@ -29,17 +29,26 @@
 //#include <mysql/plugin_audit.h>
 
 #include <mysql.h>
+#include <mysql_com.h>
+
+#define TO_STRING(x) #x
 
 // 0 - off, otherwise how many previouse passwords check
 static unsigned history= 0;
 // 0 - off, otherwise number of days to check
 static unsigned interval= 0;
 
+static void report_sql_error(MYSQL *mysql)
+{
+  my_printf_error(ER_UNKNOWN_ERROR, "[%d] %s", ME_WARNING,
+                  mysql_errno(mysql), mysql_error(mysql));
+}
+
 static int validate(const MYSQL_CONST_LEX_STRING *username,
                     const MYSQL_CONST_LEX_STRING *password)
 {
-  MYSQL *mysql;
-  //MYSQL_RES *res;
+  MYSQL *mysql= NULL;
+  MYSQL_RES *res= NULL;
   mysql= mysql_init(NULL);
   /*
   my_printf_error(ER_UNKNOWN_ERROR,
@@ -47,15 +56,47 @@ static int validate(const MYSQL_CONST_LEX_STRING *username,
   my_printf_error(ER_UNKNOWN_ERROR,
                   password->str, ME_WARNING);
   */
+  my_printf_error(ER_UNKNOWN_ERROR,
+                  "host lengh: " TO_STRING(HOSTNAME_LENGTH) "))", ME_WARNING);
+
+  if (history == 0 && interval == 0)
+  {
+    my_printf_error(ER_UNKNOWN_ERROR,
+                    "Reuse pawwrords plugin is OFF. Set configuration "
+                    "variables to enable it.", ME_WARNING);
+    return 0; // allow ewerything according to the variables values
+  }
+
   if (mysql_real_connect_local(mysql, NULL, NULL, NULL, 0) == NULL)
-    return 1;
+    goto sql_error;
+
 
   if (mysql_real_query(mysql,
         STRING_WITH_LEN("select Password from mysql.password_history")))
-    return 1;
+  {
+    if (mysql_errno(mysql) != ER_NO_SUCH_TABLE)
+    {
+      report_sql_error(mysql);
+      return 1;
+    }
+    if (mysql_real_query(mysql,
+        STRING_WITH_LEN("CREATE table mysql.password_history ("
+                        "Host varchar(" TO_STRING(HOSTNAME_LENGTH) "),"
+                        "User varchar)" )))
+    {
+    }
+  }
+  //mysql_free_result(res);
+  mysql_close(mysql);
+  return 0; // OK
 
-  return 1; // fail
-  return 0; // pass
+sql_error:
+  report_sql_error(mysql);
+  if (res)
+    mysql_free_result(res);
+  if (mysql)
+    mysql_close(mysql);
+  return 1; // Error
 }
 
 static MYSQL_SYSVAR_UINT(history, history, PLUGIN_VAR_RQCMDARG,
