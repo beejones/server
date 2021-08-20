@@ -1,4 +1,4 @@
-/* Copyright 2008-2015 Codership Oy <http://www.codership.com>
+/* Copyright 2008-2021 Codership Oy <http://www.codership.com>
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1694,13 +1694,18 @@ static int wsrep_TOI_begin(THD *thd, char *db_, char *table_,
   case SQLCOM_DROP_TABLE:
     buf_err= wsrep_drop_table_query(thd, &buf, &buf_len);
     break;
-  case SQLCOM_CREATE_ROLE:
+  case SQLCOM_KILL:
+    WSREP_DEBUG("KILL as TOI: %s", thd->query());
+    buf_err= wsrep_to_buf_helper(thd, thd->query(), thd->query_length(),
+                                 &buf, &buf_len);
+    break;
+ case SQLCOM_CREATE_ROLE:
     if (sp_process_definer(thd))
     {
       WSREP_WARN("Failed to set CREATE ROLE definer for TOI.");
     }
     /* fallthrough */
-  default:
+   default:
     buf_err= wsrep_to_buf_helper(thd, thd->query(), thd->query_length(),
                                  &buf, &buf_len);
     break;
@@ -2762,7 +2767,7 @@ extern "C" void wsrep_thd_awake(THD *thd, my_bool signal)
 {
   if (signal)
   {
-    thd->awake(KILL_QUERY);
+    thd->awake_no_mutex(KILL_QUERY);
   }
   else
   {

@@ -3229,7 +3229,14 @@ public:
   void close_active_vio();
 #endif
   void awake(killed_state state_to_set);
- 
+
+  inline void awake_no_mutex(killed_state state_to_set)
+  {
+    mysql_mutex_lock(&LOCK_thd_data);
+    awake(state_to_set);
+    mysql_mutex_unlock(&LOCK_thd_data);
+  }
+
   /** Disconnect the associated communication endpoint. */
   void disconnect();
 
