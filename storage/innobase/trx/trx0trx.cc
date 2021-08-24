@@ -1636,6 +1636,7 @@ trx_mark_sql_stat_end(
 		if (trx->is_bulk_insert()) {
 			/* Allow a subsequent INSERT into an empty table
 			if !unique_checks && !foreign_key_checks. */
+			trx->write_all_bulk();
 			return;
 		}
 

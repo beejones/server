@@ -36,6 +36,7 @@ Created 3/26/1996 Heikki Tuuri
 #include "fts0fts.h"
 #include "read0types.h"
 #include "ilist.h"
+#include "row0merge.h"
 
 #include <vector>
 
@@ -403,6 +404,9 @@ class trx_mod_table_time_t
   /** First modification of a system versioned column
   (NONE= no versioning, BULK= the table was dropped) */
   undo_no_t first_versioned= NONE;
+
+  /** Buffer to store insert opertion */
+  row_merge_bulk_t *bulk_store= nullptr;
 public:
   /** Constructor
   @param rows   number of modified rows so far */
@@ -436,8 +440,24 @@ public:
     first_versioned= BULK;
   }
 
-  /** Notify the start of a bulk insert operation */
-  void start_bulk_insert() { first|= BULK; }
+  /** Notify the start of a bulk insert operation
+  @param 	trx	transaction to do bulk insert
+  @param	table	table to do bulk operation */
+  bool start_bulk_insert(trx_t *trx, dict_table_t *table)
+  {
+    first|= BULK;
+    if (table->is_temporary())
+      return true;
+    dberr_t err= DB_SUCCESS;
+    bulk_store= new row_merge_bulk_t(table, trx, err);
+    if (err != DB_SUCCESS)
+    {
+      delete bulk_store;
+      bulk_store= nullptr;
+      return false;
+    }
+    return true;
+  }
 
   /** Notify the end of a bulk insert operation */
   void end_bulk_insert() { first&= ~BULK; }
@@ -457,6 +477,30 @@ public:
       first_versioned= NONE;
     return false;
   }
+
+  /** Add the tuple to the transaction bulk buffer for the
+  given index
+  @param	entry	tuple to be inserted
+  @param	index	bulk insert for the index */
+  dberr_t add_tuple(dtuple_t *entry, const dict_index_t *index)
+  {
+    return bulk_store->add_tuple(entry, index);
+  }
+
+  /** Do bulk insert operation present in the buffered operation
+  @return DB_SUCCESS or error code */
+  dberr_t write_bulk()
+  {
+    if (!bulk_store)
+      return DB_SUCCESS;
+    dberr_t err= bulk_store->write_to_table();
+    delete bulk_store;
+    bulk_store= nullptr;
+    return err;
+  }
+
+  /** @return whether the buffer storage exist */
+  bool bulk_buffer_exist() { return bulk_store != nullptr; }
 };
 
 /** Collection of persistent tables and their first modification
@@ -1028,6 +1072,38 @@ public:
       if (t.second.is_bulk_insert())
         return true;
     return false;
+  }
+
+  /** @return logical modification time of a table */
+  trx_mod_table_time_t *is_bulk_exists(dict_table_t *table)
+  {
+    if (!bulk_insert || check_unique_secondary || check_foreigns)
+      return nullptr;
+    auto it= mod_tables.find(table);
+    if (it == mod_tables.end()
+        || !it->second.is_bulk_insert())
+      return nullptr;
+    return &it->second;
+  }
+
+  /** Do the bulk insert for the buffered insert operation
+  for the transaction.
+  @return DB_SUCCESS or error code */
+  dberr_t write_all_bulk()
+  {
+    if (!bulk_insert || check_unique_secondary || check_foreigns)
+      return DB_SUCCESS;
+    for (auto& t : mod_tables)
+    {
+      if (t.second.is_bulk_insert())
+      {
+        dberr_t err= t.second.write_bulk();
+        if (err != DB_SUCCESS)
+          return err;
+      }
+    }
+
+    return DB_SUCCESS;
   }
 
 private:

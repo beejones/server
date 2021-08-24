@@ -3681,6 +3681,17 @@ static ulonglong innodb_prepare_commit_versioned(THD* thd, ulonglong *trx_id)
 	return 0;
 }
 
+/** Apply all bulk buffered insert operations by the transaction.
+@param[in,out]	thd	current session
+@retval	0 If bulk insert write happnes successfully */
+static int innodb_bulk_insert_write(THD* thd)
+{
+  if (trx_t* trx = thd_to_trx(thd))
+    if (trx->write_all_bulk() != DB_SUCCESS)
+      return 1;
+  return 0;
+}
+
 /** Initialize and normalize innodb_buffer_pool_size. */
 static void innodb_buffer_pool_size_init()
 {
@@ -4108,6 +4119,8 @@ static int innodb_init(void* p)
 	/* System Versioning */
 	innobase_hton->prepare_commit_versioned
 		= innodb_prepare_commit_versioned;
+
+	innobase_hton->bulk_insert_write = innodb_bulk_insert_write;
 
 	innodb_remember_check_sysvar_funcs();
 
@@ -15576,6 +15589,7 @@ ha_innobase::extra(
 		if (trx->is_bulk_insert()) {
 			/* Allow a subsequent INSERT into an empty table
 			if !unique_checks && !foreign_key_checks. */
+			trx->write_all_bulk();
 			break;
 		}
 		goto stmt_boundary;

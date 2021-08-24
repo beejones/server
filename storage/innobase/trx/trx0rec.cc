@@ -2003,6 +2003,7 @@ trx_undo_report_row_operation(
 #ifdef UNIV_DEBUG
 	int		loop_count	= 0;
 #endif /* UNIV_DEBUG */
+	const bool	is_temp	= index->table->is_temporary();
 
 	ut_a(dict_index_is_clust(index));
 	ut_ad(!update || rec);
@@ -2021,6 +2022,7 @@ trx_undo_report_row_operation(
 	ut_ad(m.first->second.valid(trx->undo_no));
 
 	bool bulk = !rec;
+	dberr_t	err = DB_SUCCESS;
 
 	if (!bulk) {
 		/* An UPDATE or DELETE must not be covered by an
@@ -2035,10 +2037,21 @@ trx_undo_report_row_operation(
 		ut_ad(thr->run_node);
 		ut_ad(que_node_get_type(thr->run_node) == QUE_NODE_INSERT);
 		ut_ad(trx->bulk_insert);
-		return DB_SUCCESS;
+		return err;
 	} else if (m.second && trx->bulk_insert
 		   && trx_has_lock_x(*trx, *index->table)) {
-		m.first->second.start_bulk_insert();
+		if (!m.first->second.start_bulk_insert(
+				trx, index->table))
+		   return DB_UNDO_RECORD_TOO_BIG;
+
+		if (!is_temp) {
+			err = m.first->second.add_tuple(
+				const_cast<dtuple_t*>(
+					clust_entry), index);
+			if (err != DB_SUCCESS) {
+				return err;
+			}
+		}
 	} else {
 		bulk = false;
 	}
@@ -2047,7 +2060,6 @@ trx_undo_report_row_operation(
 	mtr.start();
 	trx_undo_t**	pundo;
 	trx_rseg_t*	rseg;
-	const bool	is_temp	= index->table->is_temporary();
 
 	if (is_temp) {
 		mtr.set_log_mode(MTR_LOG_NO_REDO);
@@ -2061,7 +2073,6 @@ trx_undo_report_row_operation(
 		rseg = trx->rsegs.m_redo.rseg;
 	}
 
-	dberr_t		err;
 	buf_block_t*	undo_block = trx_undo_assign_low(trx, rseg, pundo,
 							 &err, &mtr);
 	trx_undo_t*	undo	= *pundo;

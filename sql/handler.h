@@ -1789,6 +1789,12 @@ struct handlerton
   int (*create_partitioning_metadata)(const char *path,
                                       const char *old_path,
                                       chf_create_flags action_flag);
+
+  /*
+    This method is used to apply buffered bulk insert operations
+    during single statement commit operation
+  */
+  int (*bulk_insert_write)(THD *thd);
 };
 
 

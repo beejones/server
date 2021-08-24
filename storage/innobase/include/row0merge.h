@@ -266,15 +266,16 @@ row_merge_build_indexes(
 	bool			allow_non_null)
 	MY_ATTRIBUTE((warn_unused_result));
 
-/********************************************************************//**
-Write a buffer to a block. */
+/** Write a buffer to a block.
+@param[in]	buf		sorted buffer
+@param[in]	of		output file
+@param[out] 	block		buffer for writing to file
+@param[in,out]	blob_file	blob file handle for doing
+				bulk insert operation */
 void
 row_merge_buf_write(
-/*================*/
-	const row_merge_buf_t*	buf,	/*!< in: sorted buffer */
-	const merge_file_t*	of,	/*!< in: output file */
-	row_merge_block_t*	block)	/*!< out: buffer for writing to file */
-	MY_ATTRIBUTE((nonnull));
+  const row_merge_buf_t *buf, const merge_file_t *of,
+  row_merge_block_t *block, merge_file_t *blob_file=nullptr);
 
 /********************************************************************//**
 Sort a buffer. */
@@ -409,4 +410,75 @@ row_merge_read_rec(
 	row_merge_block_t*	crypt_block, /*!< in: crypt buf or NULL */
 	ulint			space)	   /*!< in: space id */
 	MY_ATTRIBUTE((warn_unused_result));
+
+/**  Data structure for storing the insert bulk operation. */
+class row_merge_bulk_t
+{
+  /* Table which undergoes bulk insert operation */
+  dict_table_t *m_table;
+  /* Transaction which does bulk insert operation */
+  trx_t *m_trx;
+  /* Buffer for each index in the table. main memory
+  buffer for sorting the index */
+  row_merge_buf_t **m_merge_buf;
+  /* Block for IO operation */
+  row_merge_block_t *m_block;
+  /* File to store the buffer and used for merge sort */
+  merge_file_t *m_merge_files;
+  /* Temporary file to be used for merge sort */
+  pfs_os_file_t m_tmpfd;
+  /* Allocate memory for merge file data structure */
+  ut_allocator<row_merge_block_t> m_alloc;
+  /* Storage for description for the m_alloc */
+  ut_new_pfx_t m_block_pfx;
+  /* Temporary file to store the blob for buffered insert */
+  merge_file_t m_blob_file;
+public:
+  /** Constructor.
+  Create all merge files, merge buffer for all the table indexes
+  expect fts indexes.
+  Create a merge block which is used to write IO operation
+  @param table	table which undergoes bulk insert operation
+  @param trx	transaction which does bulk insert operation
+  @param err	error to return if memory allocation fails */
+  row_merge_bulk_t(dict_table_t *table, trx_t *trx, dberr_t &err);
+
+  /* Destructor.
+  Remove all merge files, merge buffer for all table indexes. */
+  ~row_merge_bulk_t();
+
+  /** Remove all buffer for the table indexes */
+  void remove_all_bulk_buffer();
+
+  /** Clean the merge buffer for the given index number */
+  void clean_bulk_buffer(ulint index_no);
+
+  /** Create the temporary file for the given index number
+  @retval true if temporary file creation went well */
+  bool create_tmp_file(ulint index_no);
+
+  /** Write the merge buffer to the tmp file for the given
+  index number.
+  @param index_no	buffer to be written for the index */
+  dberr_t write_to_tmp_file(ulint index_no);
+
+  /** Add the tuple to the merge buffer for the given index.
+  If the buffer ran out of memory then write the buffer into
+  the temporary file and do insert the tuple again.
+  @param	row	tuple to be inserted
+  @param	ind	index to be buffered
+  @return DB_SUCCESS if buffered insert operation went well */
+  dberr_t add_tuple(dtuple_t *row, const dict_index_t *ind);
+
+  /** Do bulk insert operation into the index tree from
+  buffer or merge file if exists
+  @param	index_no	 index to be inserted
+  @return DB_SUCCESS if bulk insert operation was succesful */
+  dberr_t write_to_index(ulint index_no);
+
+  /** Do bulk insert for the buffered insert for the table.
+  @return DB_SUCCES or error code */
+  dberr_t write_to_table();
+};
+
 #endif /* row0merge.h */

@@ -2544,6 +2544,7 @@ row_ins_clust_index_entry_low(
 	rec_offs_init(offsets_);
 	trx_t*		trx	= thr_get_trx(thr);
 	buf_block_t*	block;
+	bool		is_temp = index->table->is_temporary();
 
 	DBUG_ENTER("row_ins_clust_index_entry_low");
 
@@ -2553,9 +2554,18 @@ row_ins_clust_index_entry_low(
 	ut_ad(!n_uniq || n_uniq == dict_index_get_n_unique(index));
 	ut_ad(!trx->in_rollback);
 
+	if (!is_temp) {
+		/* Insert the data into bulk buffer if exists */
+		auto it= trx->is_bulk_exists(index->table);
+		if (it != nullptr && it->bulk_buffer_exist()) {
+			err = it->add_tuple(entry, index);
+			DBUG_RETURN(err);
+		}
+	}
+
 	mtr_start(&mtr);
 
-	if (index->table->is_temporary()) {
+	if (is_temp) {
 		/* Disable REDO logging as the lifetime of temp-tables is
 		limited to server or connection lifetime and so REDO
 		information is not needed on restart for recovery.
@@ -2640,7 +2650,7 @@ commit_exit:
 	    && !thd_is_slave(trx->mysql_thd) /* FIXME: MDEV-24622 */) {
 		DEBUG_SYNC_C("empty_root_page_insert");
 
-		if (!index->table->is_temporary()) {
+		if (!is_temp) {
 			err = lock_table(index->table, LOCK_X, thr);
 
 			if (err != DB_SUCCESS) {
@@ -2666,6 +2676,23 @@ commit_exit:
 		}
 
 		trx->bulk_insert = true;
+
+		if (!is_temp) {
+
+			/* Write TRX_UNDO_EMPTY undo log and
+			start buffering the insert operation */
+			err = trx_undo_report_row_operation(
+				thr, index, entry,
+				nullptr, 0, nullptr, nullptr,
+				nullptr);
+
+			if (err != DB_SUCCESS) {
+				trx->bulk_insert = false;
+				goto skip_bulk_insert;
+			}
+
+			goto commit_exit;
+		}
 	}
 
 skip_bulk_insert:
@@ -3268,10 +3295,19 @@ row_ins_sec_index_entry(
 	bool		check_foreign) /*!< in: true if check
 				foreign table is needed, false otherwise */
 {
-	dberr_t		err;
+	dberr_t		err = DB_SUCCESS;
 	mem_heap_t*	offsets_heap;
 	mem_heap_t*	heap;
 	trx_id_t	trx_id  = 0;
+	trx_t*		trx = thr_get_trx(thr);
+	auto		mod_table_it = trx->is_bulk_exists(index->table);
+
+	/* Insert the data into bulk buffer if it exists */
+	if (mod_table_it != nullptr
+	    && mod_table_it->bulk_buffer_exist()) {
+		mod_table_it->add_tuple(entry, index);
+		return err;
+	}
 
 	DBUG_EXECUTE_IF("row_ins_sec_index_entry_timeout", {
 			DBUG_SET("-d,row_ins_sec_index_entry_timeout");
@@ -3286,7 +3322,7 @@ row_ins_sec_index_entry(
 		}
 	}
 
-	ut_ad(thr_get_trx(thr)->id != 0);
+	ut_ad(trx->id != 0);
 
 	offsets_heap = mem_heap_create(1024);
 	heap = mem_heap_create(1024);
