@@ -5102,6 +5102,7 @@ add_to_buf:
     if (err != DB_SUCCESS)
       return err;
     clean_bulk_buffer(i);
+    buf= m_merge_buf[i];
     goto add_to_buf;
   }
 
