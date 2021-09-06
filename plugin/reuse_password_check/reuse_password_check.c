@@ -31,12 +31,26 @@
 #include <mysql.h>
 #include <mysql_com.h>
 
-#define TO_STRING(x) #x
+#include <mysql/service_sha2.h>
 
-// 0 - off, otherwise how many previouse passwords check
-static unsigned history= 0;
-// 0 - off, otherwise number of days to check
+#define HISTORY_DB_NAME "reuse_password_check_history"
+
+#define SQL_BUFF_LEN 2048
+
+// 0 - unlimit, otherwise number of days to check
 static unsigned interval= 0;
+
+static char digits[]= "0123456789ABCDEF";
+
+static void bin_to_hex512(char *to, const unsigned char *str)
+{
+  const unsigned char *str_end= str + (512/8);
+  for (; str != str_end; ++str)
+  {
+    *to++= digits[((uchar) *str) >> 4];
+    *to++= digits[((uchar) *str) & 0x0F];
+  }
+}
 
 static void report_sql_error(MYSQL *mysql)
 {
@@ -44,72 +58,140 @@ static void report_sql_error(MYSQL *mysql)
                   mysql_errno(mysql), mysql_error(mysql));
 }
 
-static int validate(const MYSQL_CONST_LEX_STRING *username,
-                    const MYSQL_CONST_LEX_STRING *password)
+static int create_table(MYSQL *mysql)
 {
-  MYSQL *mysql= NULL;
-  MYSQL_RES *res= NULL;
-  mysql= mysql_init(NULL);
-  /*
-  my_printf_error(ER_UNKNOWN_ERROR,
-                  username->str, ME_WARNING);
-  my_printf_error(ER_UNKNOWN_ERROR,
-                  password->str, ME_WARNING);
-  */
-  my_printf_error(ER_UNKNOWN_ERROR,
-                  "host lengh: " TO_STRING(HOSTNAME_LENGTH) "))", ME_WARNING);
-
-  if (history == 0 && interval == 0)
-  {
-    my_printf_error(ER_UNKNOWN_ERROR,
-                    "Reuse pawwrords plugin is OFF. Set configuration "
-                    "variables to enable it.", ME_WARNING);
-    return 0; // allow ewerything according to the variables values
-  }
-
-  if (mysql_real_connect_local(mysql, NULL, NULL, NULL, 0) == NULL)
-    goto sql_error;
-
-
   if (mysql_real_query(mysql,
-        STRING_WITH_LEN("select Password from mysql.password_history")))
+        // 512/8 = 64
+        STRING_WITH_LEN("CREATE TABLE mysql." HISTORY_DB_NAME
+                        " ( hash binary(64),"
+                        " time timestamp,"
+                        " primary key (hash), index tm (time) )"
+                        " ENGINE=Aria")))
   {
-    if (mysql_errno(mysql) != ER_NO_SUCH_TABLE)
+    report_sql_error(mysql);
+    return 1;
+  }
+  return 0;
+}
+
+
+/**
+  Run this query and create table if needed for it
+
+  @param mysql           connection handler
+  @param query           The query to run
+  @param len             length of the query text
+
+  @retval 1 - Error
+  @retval 0 - OK
+*/
+
+static int run_query_with_table_creation(MYSQL *mysql, const char *query,
+                                         size_t len)
+{
+  if (unlikely(mysql_real_query(mysql, query, len)))
+  {
+    unsigned int rc= mysql_errno(mysql);
+    if (rc != ER_NO_SUCH_TABLE)
+    {
+      // supress this error in case of try to add the same password twice
+      if (rc != ER_DUP_ENTRY)
+        report_sql_error(mysql);
+      return 1;
+    }
+    if (create_table(mysql))
+      return 1;
+    if (unlikely(mysql_real_query(mysql, query, len)))
     {
       report_sql_error(mysql);
       return 1;
     }
-    if (mysql_real_query(mysql,
-        STRING_WITH_LEN("CREATE table mysql.password_history ("
-                        "Host varchar(" TO_STRING(HOSTNAME_LENGTH) "),"
-                        "User varchar)" )))
-    {
-    }
   }
-  //mysql_free_result(res);
+  return 0;
+}
+
+static int validate(const MYSQL_CONST_LEX_STRING *username,
+                    const MYSQL_CONST_LEX_STRING *password,
+                    const MYSQL_CONST_LEX_STRING *hostname)
+{
+  MYSQL *mysql= NULL;
+  size_t key_len= username->length + password->length + hostname->length;
+  size_t buff_len= (key_len > SQL_BUFF_LEN ? key_len : SQL_BUFF_LEN);
+  size_t len;
+  char *buff= malloc(buff_len);
+  unsigned char hash[512/8];
+  char escaped_hash[512/8*2 + 1];
+  if (!buff)
+    return 1;
+
+  mysql= mysql_init(NULL);
+  if (!mysql)
+  {
+    free(buff);
+    return 1;
+  }
+
+  memcpy(buff, hostname->str, hostname->length);
+  memcpy(buff + hostname->length, username->str, username->length);
+  memcpy(buff + hostname->length + username->length, password->str,
+          password->length);
+  buff[key_len]= 0;
+  bzero(hash, sizeof(hash));
+  my_sha512(hash, buff, key_len);
+  /*
+  my_printf_error(ER_UNKNOWN_ERROR,
+                  "user (%d): '%s'", ME_WARNING,
+                  username->length, username->str);
+  my_printf_error(ER_UNKNOWN_ERROR,
+                  "host (%d): '%s'", ME_WARNING,
+                  hostname->length, hostname->str);
+  my_printf_error(ER_UNKNOWN_ERROR,
+                  "pswd (%d): '%s'", ME_WARNING,
+                  password->length, password->str);
+  my_printf_error(ER_UNKNOWN_ERROR,
+                  "key (%d): '%s'", ME_WARNING,
+                  key_len, buff);
+  */
+  if (mysql_real_connect_local(mysql, NULL, NULL, NULL, 0) == NULL)
+    goto sql_error;
+
+  if (interval)
+  {
+    // trim the table
+    len= snprintf(buff, buff_len,
+                  "DELETE FROM mysql." HISTORY_DB_NAME
+                  " WHERE time < DATE_SUB(NOW(), interval %d day)",
+                  interval);
+    if (unlikely(run_query_with_table_creation(mysql, buff, len)))
+      goto sql_error;
+  }
+
+  bin_to_hex512(escaped_hash, hash);
+  escaped_hash[512/8*2]= '\0';
+  len= snprintf(buff, buff_len,
+                "INSERT INTO mysql." HISTORY_DB_NAME "(hash) "
+                "values (x'%s')",
+                escaped_hash);
+  if (unlikely(run_query_with_table_creation(mysql, buff, len)))
+    goto sql_error;
+
+  free(buff);
   mysql_close(mysql);
   return 0; // OK
 
 sql_error:
-  report_sql_error(mysql);
-  if (res)
-    mysql_free_result(res);
+  free(buff);
   if (mysql)
     mysql_close(mysql);
   return 1; // Error
 }
 
-static MYSQL_SYSVAR_UINT(history, history, PLUGIN_VAR_RQCMDARG,
-  "How many previous passwords to check (0 means off)", NULL, NULL,
-  0, 0, 1000, 1);
-
 static MYSQL_SYSVAR_UINT(interval, interval, PLUGIN_VAR_RQCMDARG,
-  "How old (in days) passwords to check (0 means off)", NULL, NULL,
+  "How old (in days) passwords to check (0 means infinity)", NULL, NULL,
   0, 0, 365*10, 1);
 
 
 static struct st_mysql_sys_var* sysvars[]= {
-  MYSQL_SYSVAR(history),
   MYSQL_SYSVAR(interval),
   NULL
 };
