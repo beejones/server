@@ -3687,7 +3687,7 @@ static ulonglong innodb_prepare_commit_versioned(THD* thd, ulonglong *trx_id)
 static int innodb_bulk_insert_write(THD* thd)
 {
   if (trx_t* trx = thd_to_trx(thd))
-    if (trx->write_all_bulk() != DB_SUCCESS)
+    if (trx->bulk_insert_apply() != DB_SUCCESS)
       return 1;
   return 0;
 }
@@ -15589,7 +15589,10 @@ ha_innobase::extra(
 		if (trx->is_bulk_insert()) {
 			/* Allow a subsequent INSERT into an empty table
 			if !unique_checks && !foreign_key_checks. */
-			trx->write_all_bulk();
+			dberr_t err= trx->bulk_insert_apply();
+			if (err != DB_SUCCESS) {
+				return err;
+			}
 			break;
 		}
 		goto stmt_boundary;

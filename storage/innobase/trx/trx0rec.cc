@@ -2045,9 +2045,9 @@ trx_undo_report_row_operation(
 		   return DB_UNDO_RECORD_TOO_BIG;
 
 		if (!is_temp) {
-			err = m.first->second.add_tuple(
+			err = m.first->second.bulk_insert_buffered(
 				const_cast<dtuple_t*>(
-					clust_entry), index);
+					clust_entry), index, trx);
 			if (err != DB_SUCCESS) {
 				return err;
 			}

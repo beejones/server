@@ -2544,7 +2544,6 @@ row_ins_clust_index_entry_low(
 	rec_offs_init(offsets_);
 	trx_t*		trx	= thr_get_trx(thr);
 	buf_block_t*	block;
-	bool		is_temp = index->table->is_temporary();
 
 	DBUG_ENTER("row_ins_clust_index_entry_low");
 
@@ -2554,18 +2553,9 @@ row_ins_clust_index_entry_low(
 	ut_ad(!n_uniq || n_uniq == dict_index_get_n_unique(index));
 	ut_ad(!trx->in_rollback);
 
-	if (!is_temp) {
-		/* Insert the data into bulk buffer if exists */
-		auto it= trx->is_bulk_exists(index->table);
-		if (it != nullptr && it->bulk_buffer_exist()) {
-			err = it->add_tuple(entry, index);
-			DBUG_RETURN(err);
-		}
-	}
-
 	mtr_start(&mtr);
 
-	if (is_temp) {
+	if (index->table->is_temporary()) {
 		/* Disable REDO logging as the lifetime of temp-tables is
 		limited to server or connection lifetime and so REDO
 		information is not needed on restart for recovery.
@@ -2650,15 +2640,20 @@ commit_exit:
 	    && !thd_is_slave(trx->mysql_thd) /* FIXME: MDEV-24622 */) {
 		DEBUG_SYNC_C("empty_root_page_insert");
 
-		if (!is_temp) {
+		trx->bulk_insert = true;
+
+		if (!index->table->is_temporary()) {
 			err = lock_table(index->table, LOCK_X, thr);
 
 			if (err != DB_SUCCESS) {
 				trx->error_state = err;
+				trx->bulk_insert = false;
 				goto commit_exit;
 			}
 
 			if (index->table->n_rec_locks) {
+avoid_bulk:
+				trx->bulk_insert = false;
 				goto skip_bulk_insert;
 			}
 
@@ -2673,11 +2668,6 @@ commit_exit:
 #else /* BTR_CUR_HASH_ADAPT */
 			index->table->bulk_trx_id = trx->id;
 #endif /* BTR_CUR_HASH_ADAPT */
-		}
-
-		trx->bulk_insert = true;
-
-		if (!is_temp) {
 
 			/* Write TRX_UNDO_EMPTY undo log and
 			start buffering the insert operation */
@@ -2687,8 +2677,7 @@ commit_exit:
 				nullptr);
 
 			if (err != DB_SUCCESS) {
-				trx->bulk_insert = false;
-				goto skip_bulk_insert;
+				goto avoid_bulk;
 			}
 
 			goto commit_exit;
@@ -3300,14 +3289,6 @@ row_ins_sec_index_entry(
 	mem_heap_t*	heap;
 	trx_id_t	trx_id  = 0;
 	trx_t*		trx = thr_get_trx(thr);
-	auto		mod_table_it = trx->is_bulk_exists(index->table);
-
-	/* Insert the data into bulk buffer if it exists */
-	if (mod_table_it != nullptr
-	    && mod_table_it->bulk_buffer_exist()) {
-		mod_table_it->add_tuple(entry, index);
-		return err;
-	}
 
 	DBUG_EXECUTE_IF("row_ins_sec_index_entry_timeout", {
 			DBUG_SET("-d,row_ins_sec_index_entry_timeout");
@@ -3387,6 +3368,12 @@ row_ins_index_entry(
 	DBUG_EXECUTE_IF("row_ins_index_entry_timeout", {
 			DBUG_SET("-d,row_ins_index_entry_timeout");
 			return(DB_LOCK_WAIT);});
+
+	auto it= thr_get_trx(thr)->check_bulk_buffer(index->table);
+	if (it) {
+		return it->bulk_insert_buffered(
+				entry, index, thr_get_trx(thr));
+	}
 
 	if (index->is_primary()) {
 		return row_ins_clust_index_entry(index, entry, thr, 0);

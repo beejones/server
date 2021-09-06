@@ -449,7 +449,7 @@ public:
     if (table->is_temporary())
       return true;
     dberr_t err= DB_SUCCESS;
-    bulk_store= new row_merge_bulk_t(table, trx, err);
+    bulk_store= new row_merge_bulk_t(table, err);
     if (err != DB_SUCCESS)
     {
       delete bulk_store;
@@ -482,25 +482,31 @@ public:
   given index
   @param	entry	tuple to be inserted
   @param	index	bulk insert for the index */
-  dberr_t add_tuple(dtuple_t *entry, const dict_index_t *index)
+  dberr_t bulk_insert_buffered(
+     dtuple_t *entry, const dict_index_t *index, trx_t *trx)
   {
-    return bulk_store->add_tuple(entry, index);
+    return bulk_store->bulk_insert_buffered(entry, index, trx);
   }
 
   /** Do bulk insert operation present in the buffered operation
   @return DB_SUCCESS or error code */
-  dberr_t write_bulk()
+  dberr_t write_bulk(dict_table_t *table, trx_t *trx)
   {
     if (!bulk_store)
       return DB_SUCCESS;
-    dberr_t err= bulk_store->write_to_table();
+    dberr_t err= bulk_store->write_to_table(table, trx);
     delete bulk_store;
     bulk_store= nullptr;
     return err;
   }
 
   /** @return whether the buffer storage exist */
-  bool bulk_buffer_exist() { return bulk_store != nullptr; }
+  bool bulk_buffer_exist()
+  {
+    if (is_bulk_insert() && bulk_store)
+      return true;
+    return false;
+  }
 };
 
 /** Collection of persistent tables and their first modification
@@ -1074,14 +1080,16 @@ public:
     return false;
   }
 
-  /** @return logical modification time of a table */
-  trx_mod_table_time_t *is_bulk_exists(dict_table_t *table)
+  /** @return logical modification time of a table only
+  if the table has bulk buffer exist in the transaction */
+  trx_mod_table_time_t *check_bulk_buffer(dict_table_t *table)
   {
-    if (!bulk_insert || check_unique_secondary || check_foreigns)
+    if (UNIV_LIKELY(!bulk_insert))
       return nullptr;
+    ut_ad(!check_unique_secondary);
+    ut_ad(!check_foreigns);
     auto it= mod_tables.find(table);
-    if (it == mod_tables.end()
-        || !it->second.is_bulk_insert())
+    if (it == mod_tables.end() || !it->second.bulk_buffer_exist())
       return nullptr;
     return &it->second;
   }
@@ -1089,20 +1097,16 @@ public:
   /** Do the bulk insert for the buffered insert operation
   for the transaction.
   @return DB_SUCCESS or error code */
-  dberr_t write_all_bulk()
+  dberr_t bulk_insert_apply()
   {
-    if (!bulk_insert || check_unique_secondary || check_foreigns)
+    if (!bulk_insert)
       return DB_SUCCESS;
+    ut_ad(!check_unique_secondary);
+    ut_ad(!check_foreigns);
     for (auto& t : mod_tables)
-    {
       if (t.second.is_bulk_insert())
-      {
-        dberr_t err= t.second.write_bulk();
-        if (err != DB_SUCCESS)
+        if (dberr_t err= t.second.write_bulk(t.first, this))
           return err;
-      }
-    }
-
     return DB_SUCCESS;
   }
 

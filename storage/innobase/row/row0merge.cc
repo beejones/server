@@ -284,11 +284,11 @@ row_merge_insert_index_tuples(
 	const row_merge_buf_t*	row_buf,
 	BtrBulk*		btr_bulk,
 	const ib_uint64_t	table_total_rows,
-	const double		pct_progress,
-	const double		pct_cost,
+	double			pct_progress,
+	double			pct_cost,
 	row_merge_block_t*	crypt_block,
 	ulint			space,
-	ut_stage_alter_t*	stage = NULL,
+	ut_stage_alter_t*	stage= nullptr,
 	merge_file_t*		blob_file= nullptr);
 
 /******************************************************//**
@@ -327,35 +327,23 @@ row_merge_buf_encode(
 	*b += size;
 }
 
-/******************************************************//**
-Allocate a sort buffer.
-@return own: sort buffer */
 static MY_ATTRIBUTE((malloc, nonnull))
 row_merge_buf_t*
 row_merge_buf_create_low(
-/*=====================*/
-	mem_heap_t*	heap,		/*!< in: heap where allocated */
-	dict_index_t*	index,		/*!< in: secondary index */
-	ulint		max_tuples,	/*!< in: maximum number of
-					data tuples */
-	ulint		buf_size)	/*!< in: size of the buffer,
-					in bytes */
+  row_merge_buf_t *buf, mem_heap_t *heap, dict_index_t *index)
 {
-	row_merge_buf_t*	buf;
+  ulint max_tuples = srv_sort_buf_size
+                     / std::max<ulint>(1, dict_index_get_min_size(index));
+  ut_ad(max_tuples > 0);
+  ut_ad(max_tuples <= srv_sort_buf_size);
 
-	ut_ad(max_tuples > 0);
-
-	ut_ad(max_tuples <= srv_sort_buf_size);
-
-	buf = static_cast<row_merge_buf_t*>(mem_heap_zalloc(heap, buf_size));
-	buf->heap = heap;
-	buf->index = index;
-	buf->max_tuples = max_tuples;
-	buf->tuples = static_cast<mtuple_t*>(
-		ut_malloc_nokey(2 * max_tuples * sizeof *buf->tuples));
-	buf->tmp_tuples = buf->tuples + max_tuples;
-
-	return(buf);
+  buf->heap = heap;
+  buf->index = index;
+  buf->max_tuples = max_tuples;
+  buf->tuples = static_cast<mtuple_t*>(
+   ut_malloc_nokey(2 * max_tuples * sizeof *buf->tuples));
+  buf->tmp_tuples = buf->tuples + max_tuples;
+  return(buf);
 }
 
 /******************************************************//**
@@ -367,18 +355,16 @@ row_merge_buf_create(
 	dict_index_t*	index)	/*!< in: secondary index */
 {
 	row_merge_buf_t*	buf;
-	ulint			max_tuples;
 	ulint			buf_size;
 	mem_heap_t*		heap;
-
-	max_tuples = srv_sort_buf_size
-		/ std::max<ulint>(1, dict_index_get_min_size(index));
 
 	buf_size = (sizeof *buf);
 
 	heap = mem_heap_create(buf_size);
 
-	buf = row_merge_buf_create_low(heap, index, max_tuples, buf_size);
+	buf = static_cast<row_merge_buf_t*>(
+		mem_heap_zalloc(heap, buf_size));
+	row_merge_buf_create_low(buf, heap, index);
 
 	return(buf);
 }
@@ -933,6 +919,8 @@ row_merge_dup_report(
 	const dfield_t*		entry)	/*!< in: duplicate index entry */
 {
 	if (!dup->n_dup++) {
+		/* In case of bulk insert, dup->table can be
+		nullptr */
 		if (!dup->table) return;
 		/* Only report the first duplicate record,
 		but count all duplicate records. */
@@ -1071,7 +1059,7 @@ tuple field
 @param	heap		heap to store the blob offset and blob
 			length
 @param	blob_file	file to store the blob data */
-static void row_merge_buf_blob(
+static dberr_t row_merge_buf_blob(
   const mtuple_t *entry, ulint n_fields,
   mem_heap_t *heap, merge_file_t *blob_file)
 {
@@ -1090,7 +1078,8 @@ static void row_merge_buf_blob(
       IORequestWrite, "(bulk insert)", blob_file->fd,
       field->data, blob_file->offset * srv_page_size, len);
 
-    ut_a(err == DB_SUCCESS);
+    if (err != DB_SUCCESS)
+      return err;
 
     byte *data= static_cast<byte*>(
       mem_heap_alloc(heap, BTR_EXTERN_FIELD_REF_SIZE));
@@ -1106,9 +1095,11 @@ static void row_merge_buf_blob(
     dfield_set_data(field, data, BTR_EXTERN_FIELD_REF_SIZE);
     dfield_set_ext(field);
   }
+
+  return DB_SUCCESS;
 }
 
-void
+dberr_t
 row_merge_buf_write(
 	const row_merge_buf_t*	buf,
 	const merge_file_t*	of UNIV_UNUSED,
@@ -1124,9 +1115,13 @@ row_merge_buf_write(
 	for (ulint i = 0; i < buf->n_tuples; i++) {
 		const mtuple_t*	entry	= &buf->tuples[i];
 
-		if (blob_file && dict_index_is_clust(buf->index)) {
-			row_merge_buf_blob(entry, n_fields,
-					   buf->heap, blob_file);
+		if (blob_file) {
+			ut_ad(buf->index->is_primary());
+			dberr_t err = row_merge_buf_blob(
+				entry, n_fields, buf->heap, blob_file);
+			if (err != DB_SUCCESS) {
+				DBUG_RETURN(err);
+			}
 		}
 
 		row_merge_buf_encode(&b, index, entry, n_fields);
@@ -1141,7 +1136,7 @@ row_merge_buf_write(
 
 	/* Write an "end-of-chunk" marker. */
 	ut_a(b < &block[srv_sort_buf_size]);
-	//ut_a(b == &block[0] + buf->total_size);
+	ut_a(b == &block[0] + buf->total_size || blob_file);
 	*b++ = 0;
 #ifdef HAVE_valgrind
 	/* The rest of the block is uninitialized.  Initialize it
@@ -1151,7 +1146,7 @@ row_merge_buf_write(
 	DBUG_LOG("ib_merge_sort",
 		 "write " << reinterpret_cast<const void*>(b) << ','
 		 << of->fd << ',' << of->offset << " EOF");
-	DBUG_VOID_RETURN;
+	DBUG_RETURN(DB_SUCCESS);
 }
 
 /******************************************************//**
@@ -3511,7 +3506,7 @@ in field data for the tuple
 			blob storage
 @param	blob_file	file to handle blob data */
 static
-void
+dberr_t
 row_merge_copy_blob_from_file(
   dtuple_t *tuple, mem_heap_t *heap, merge_file_t *blob_file)
 {
@@ -3533,11 +3528,14 @@ row_merge_copy_blob_from_file(
     byte *data= (byte*) mem_heap_alloc(heap, len);
     dberr_t err= os_file_read(IORequestRead, blob_file->fd, data,
 			      offset, len);
-    ut_ad(err == DB_SUCCESS);
-
+    if (err != DB_SUCCESS)
+      return err;
     dfield_set_data(field, data, len);
   }
+
+  return DB_SUCCESS;
 }
+
 /** Copy externally stored columns to the data tuple.
 @param[in]	mrec		record containing BLOB pointers,
 or NULL to use tuple instead
@@ -3633,8 +3631,8 @@ row_merge_insert_index_tuples(
 	const row_merge_buf_t*	row_buf,
 	BtrBulk*		btr_bulk,
 	const ib_uint64_t	table_total_rows,
-	const double		pct_progress,
-	const double		pct_cost,
+	double			pct_progress,
+	double			pct_cost,
 	row_merge_block_t*	crypt_block,
 	ulint			space,
 	ut_stage_alter_t*	stage,
@@ -3749,40 +3747,39 @@ row_merge_insert_index_tuples(
 			}
 		}
 
-		if (dict_index_is_clust(index) && dtuple_get_n_ext(dtuple)) {
-			if (blob_file) {
-				row_merge_copy_blob_from_file(
-					dtuple, tuple_heap,
-					blob_file);
-			} else  {
+		ut_ad(!dtuple_get_n_ext(dtuple) || index->is_primary());
 
-				/* Off-page columns can be fetched
-				safely when concurrent modifications
-				to the table are disabled.
-				(Purge can process delete-marked
-				records, but
-				row_merge_read_clustered_index()
-				would have skipped them.)
-
-				When concurrent modifications are
-				enabled, row_merge_read_clustered_index()
-				will only see rows from
-				transactions that were committed
-				before the ALTER TABLE started
-				(REPEATABLE READ).
-
-				Any modifications after the
-				row_merge_read_clustered_index()
-				scan will go through
-				row_log_table_apply(). Any modifications
-				to off-page columns will be tracked
-				by row_log_table_blob_alloc() and
-				row_log_table_blob_free(). */
-				row_merge_copy_blobs(
-					mrec, offsets,
-					old_table->space->zip_size(),
-					dtuple, tuple_heap);
+		if (!dtuple_get_n_ext(dtuple)) {
+		} else if (blob_file) {
+			error = row_merge_copy_blob_from_file(
+				dtuple, tuple_heap, blob_file);
+			if (error != DB_SUCCESS) {
+				break;
 			}
+		} else {
+			/* Off-page columns can be fetched safely
+			when concurrent modifications to the table
+			are disabled.(Purge can process delete-marked
+			records, but row_merge_read_clustered_index()
+			would have skipped them.)
+
+			When concurrent modifications are enabled,
+			row_merge_read_clustered_index() will
+			only see rows from transactions that were
+			committed before the ALTER TABLE started
+			(REPEATABLE READ).
+
+			Any modifications after the
+			row_merge_read_clustered_index() scan
+			will go through row_log_table_apply().
+			Any modifications to off-page columns
+			will be tracked by
+			by row_log_table_blob_alloc() and
+			row_log_table_blob_free(). */
+			row_merge_copy_blobs(
+				mrec, offsets,
+				old_table->space->zip_size(),
+				dtuple, tuple_heap);
 		}
 
 		ut_ad(dtuple_validate(dtuple));
@@ -4966,35 +4963,50 @@ func_exit:
 	DBUG_RETURN(error);
 }
 
-row_merge_bulk_t::row_merge_bulk_t(dict_table_t *table,
-                                   trx_t *trx, dberr_t &err):
-                                   m_table(table), m_trx(trx)
+dberr_t row_merge_bulk_t::alloc_block()
 {
-  ulint n_index= UT_LIST_GET_LEN(m_table->indexes);
-  m_merge_buf= static_cast<row_merge_buf_t**>(
-    ut_malloc_nokey(n_index * sizeof *m_merge_buf));
+  if (m_block)
+    return DB_SUCCESS;
+  m_block= m_alloc.allocate_large_dontdump(
+             3 * srv_sort_buf_size, &m_block_pfx);
+  if (m_block == nullptr)
+    return DB_OUT_OF_MEMORY;
+  return DB_SUCCESS;
+}
+
+row_merge_bulk_t::row_merge_bulk_t(dict_table_t *table,
+                                   dberr_t &err)
+{
+  ulint n_index= 0;
+  for (dict_index_t *index= UT_LIST_GET_FIRST(table->indexes);
+       index; index= UT_LIST_GET_NEXT(indexes, index))
+  {
+    if (index->type & DICT_FTS)
+      continue;
+    n_index++;
+  }
+
+  m_merge_buf= static_cast<row_merge_buf_t*>(
+    ut_zalloc_nokey(n_index * sizeof *m_merge_buf));
 
   m_merge_files= static_cast<merge_file_t*>(
     ut_malloc_nokey(n_index * sizeof *m_merge_files));
 
   ulint i= 0;
-  for (dict_index_t *index= UT_LIST_GET_FIRST(m_table->indexes);
+  for (dict_index_t *index= UT_LIST_GET_FIRST(table->indexes);
        index; index= UT_LIST_GET_NEXT(indexes, index))
   {
     if (index->type & DICT_FTS)
       continue;
-    m_merge_buf[i]= row_merge_buf_create(index);
+
+    mem_heap_t *heap= mem_heap_create(100);
+    row_merge_buf_create_low(&m_merge_buf[i], heap, index);
     m_merge_files[i].fd= OS_FILE_CLOSED;
     m_merge_files[i].offset= m_merge_files[i].n_rec= 0;
     i++;
   }
 
-  m_block= m_alloc.allocate_large(
-             3 * srv_sort_buf_size, &m_block_pfx);
-  if (m_block == nullptr)
-    err= DB_OUT_OF_MEMORY;
   m_tmpfd= OS_FILE_CLOSED;
-
   m_blob_file.fd= OS_FILE_CLOSED;
   m_blob_file.offset= m_blob_file.n_rec= 0;
 }
@@ -5002,12 +5014,13 @@ row_merge_bulk_t::row_merge_bulk_t(dict_table_t *table,
 row_merge_bulk_t::~row_merge_bulk_t()
 {
   ulint i= 0;
-  for (dict_index_t *index= UT_LIST_GET_FIRST(m_table->indexes);
+  dict_table_t *table= m_merge_buf[0].index->table;
+  for (dict_index_t *index= UT_LIST_GET_FIRST(table->indexes);
        index; index= UT_LIST_GET_NEXT(indexes, index))
   {
     if (index->type & DICT_FTS)
       continue;
-    row_merge_buf_free(m_merge_buf[i]);
+    row_merge_buf_free(&m_merge_buf[i]);
     row_merge_file_destroy(&m_merge_files[i]);
     i++;
   }
@@ -5020,34 +5033,21 @@ row_merge_bulk_t::~row_merge_bulk_t()
 
   ut_free(m_merge_files);
 
-  m_alloc.deallocate_large(m_block, &m_block_pfx);
-}
-
-void row_merge_bulk_t::remove_all_bulk_buffer()
-{
-  ulint i= 0;
-  for (dict_index_t *index= UT_LIST_GET_FIRST(m_table->indexes);
-       index; index= UT_LIST_GET_NEXT(indexes, index))
-  {
-    if (index->type & DICT_FTS)
-      continue;
-    row_merge_buf_free(m_merge_buf[i]);
-    i++;
-  }
-  ut_free(m_merge_buf);
-  m_merge_buf= nullptr;
+  if (m_block)
+    m_alloc.deallocate_large(m_block, &m_block_pfx);
 }
 
 void row_merge_bulk_t::clean_bulk_buffer(ulint index_no)
 {
-  m_merge_buf[index_no]= row_merge_buf_empty(m_merge_buf[index_no]);
+  mem_heap_empty(m_merge_buf[index_no].heap);
+  m_merge_buf[index_no].total_size = m_merge_buf[index_no].n_tuples = 0;
 }
 
 bool row_merge_bulk_t::create_tmp_file(ulint index_no)
 {
   return row_merge_file_create_if_needed(
             &m_merge_files[index_no], &m_tmpfd,
-            m_merge_buf[index_no]->n_tuples, NULL);
+            m_merge_buf[index_no].n_tuples, NULL);
 }
 
 dberr_t row_merge_bulk_t::write_to_tmp_file(ulint index_no)
@@ -5055,21 +5055,30 @@ dberr_t row_merge_bulk_t::write_to_tmp_file(ulint index_no)
   if (!create_tmp_file(index_no))
     return DB_OUT_OF_MEMORY;
   merge_file_t *file= &m_merge_files[index_no];
-  row_merge_buf_t *buf= m_merge_buf[index_no];
+  row_merge_buf_t *buf= &m_merge_buf[index_no];
 
-  row_merge_buf_write(buf, file, m_block, &m_blob_file);
+  alloc_block();
+
+  dberr_t err= row_merge_buf_write(
+		buf, file, m_block,
+		index_no == 0 ? &m_blob_file : nullptr);
+  if (err != DB_SUCCESS)
+    return err;
+
   if (!row_merge_write(file->fd, file->offset++,
-                       m_block, nullptr, m_table->space->id))
+                       m_block, nullptr,
+		       buf->index->table->space->id))
     return DB_TEMP_FILE_WRITE_FAIL;
   MEM_UNDEFINED(&m_block[0], srv_sort_buf_size);
   return DB_SUCCESS;
 }
 
-dberr_t row_merge_bulk_t::add_tuple(dtuple_t *row, const dict_index_t *ind)
+dberr_t row_merge_bulk_t::bulk_insert_buffered(
+	dtuple_t *row, const dict_index_t *ind, trx_t *trx)
 {
   dberr_t err= DB_SUCCESS;
   ulint i= 0;
-  for (dict_index_t *index= UT_LIST_GET_FIRST(m_table->indexes);
+  for (dict_index_t *index= UT_LIST_GET_FIRST(ind->table->indexes);
        index; index= UT_LIST_GET_NEXT(indexes, index))
   {
      if (index->type & DICT_FTS)
@@ -5080,10 +5089,10 @@ dberr_t row_merge_bulk_t::add_tuple(dtuple_t *row, const dict_index_t *ind)
        i++;
        continue;
      }
-     row_merge_buf_t *buf= m_merge_buf[i];
+     row_merge_buf_t *buf= &m_merge_buf[i];
      merge_file_t *file= &m_merge_files[i];
 add_to_buf:
-    if (row_merge_bulk_buf_add(buf, m_table, row, m_trx))
+    if (row_merge_bulk_buf_add(buf, ind->table, row, trx))
     {
       i++;
       return err;
@@ -5102,34 +5111,35 @@ add_to_buf:
     if (err != DB_SUCCESS)
       return err;
     clean_bulk_buffer(i);
-    buf= m_merge_buf[i];
+    buf= &m_merge_buf[i];
     goto add_to_buf;
   }
 
   return err;
 }
 
-dberr_t row_merge_bulk_t::write_to_index(ulint index_no)
+dberr_t row_merge_bulk_t::write_to_index(ulint index_no, trx_t *trx)
 {
   dberr_t err= DB_SUCCESS;
-  row_merge_buf_t *buf= m_merge_buf[index_no];
+  row_merge_buf_t buf= m_merge_buf[index_no];
   merge_file_t *file= &m_merge_files[index_no];
-  dict_index_t *index= buf->index;
-  BtrBulk btr_bulk(index, m_trx);
+  dict_index_t *index= buf.index;
+  dict_table_t *table= index->table;
+  BtrBulk btr_bulk(index, trx);
   row_merge_dup_t dup = {index, nullptr, nullptr, 0};
 
-  if (buf->n_tuples)
+  if (buf.n_tuples)
   {
     if (dict_index_is_unique(index))
     {
-      row_merge_buf_sort(buf, &dup);
+      row_merge_buf_sort(&buf, &dup);
       if (dup.n_dup)
         return DB_DUPLICATE_KEY;
     }
-    else row_merge_buf_sort(buf, NULL);
+    else row_merge_buf_sort(&buf, NULL);
     if (file->fd != OS_FILE_CLOSED)
     {
-      file->n_rec+= buf->n_tuples;
+      file->n_rec+= buf.n_tuples;
       err= write_to_tmp_file(index_no);
       if (err!= DB_SUCCESS)
         goto func_exit;
@@ -5138,21 +5148,21 @@ dberr_t row_merge_bulk_t::write_to_index(ulint index_no)
     {
       /* Data got fit in merge buffer. */
       err= row_merge_insert_index_tuples(
-            index, m_table, OS_FILE_CLOSED, nullptr,
-	    buf, &btr_bulk, 0, 0, 0, nullptr, m_table->space_id);
+            index, table, OS_FILE_CLOSED, nullptr,
+	    &buf, &btr_bulk, 0, 0, 0, nullptr, table->space_id);
       goto func_exit;
     }
   }
 
-  err= row_merge_sort(m_trx, &dup, file,
+  err= row_merge_sort(trx, &dup, file,
 		      m_block, &m_tmpfd, true, 0, 0,
-		      nullptr, m_table->space_id, nullptr);
+		      nullptr, table->space_id, nullptr);
   if (err != DB_SUCCESS)
     goto func_exit;
 
   err= row_merge_insert_index_tuples(
-        index, m_table, file->fd, m_block, nullptr,
-	&btr_bulk, 0, 0, 0, nullptr, m_table->space_id,
+        index, table, file->fd, m_block, nullptr,
+	&btr_bulk, 0, 0, 0, nullptr, table->space_id,
 	nullptr, &m_blob_file);
 
 func_exit:
@@ -5160,16 +5170,16 @@ func_exit:
   return err;
 }
 
-dberr_t row_merge_bulk_t::write_to_table()
+dberr_t row_merge_bulk_t::write_to_table(dict_table_t *table, trx_t *trx)
 {
   ulint i= 0;
-  for (dict_index_t *index= UT_LIST_GET_FIRST(m_table->indexes);
+  for (dict_index_t *index= UT_LIST_GET_FIRST(table->indexes);
        index; index= UT_LIST_GET_NEXT(indexes, index))
   {
     if (index->type & DICT_FTS)
       continue;
 
-    dberr_t err= write_to_index(i);
+    dberr_t err= write_to_index(i, trx);
     if (err != DB_SUCCESS)
       return err;
     i++;
