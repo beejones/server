@@ -13,24 +13,14 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
 
-#include <mysqld_error.h>
-#include <my_attribute.h>
-#include <mysql/plugin_password_validation.h>
-
-
 #include <my_config.h>
-//#include <assert.h>
 #include <my_global.h>
 #include <my_base.h>
-//#include <typelib.h>
-//#include <ctype.h>
-//#include <string.h>
-//#include <mysql/plugin.h>
-//#include <mysql/plugin_audit.h>
-
+#include <mysql/plugin_password_validation.h>
 #include <mysql.h>
-#include <mysql_com.h>
 
+
+#include <mysqld_error.h>
 #include <mysql/service_sha2.h>
 
 #define HISTORY_DB_NAME "reuse_password_check_history"
