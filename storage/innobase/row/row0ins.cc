@@ -3288,7 +3288,6 @@ row_ins_sec_index_entry(
 	mem_heap_t*	offsets_heap;
 	mem_heap_t*	heap;
 	trx_id_t	trx_id  = 0;
-	trx_t*		trx = thr_get_trx(thr);
 
 	DBUG_EXECUTE_IF("row_ins_sec_index_entry_timeout", {
 			DBUG_SET("-d,row_ins_sec_index_entry_timeout");
@@ -3303,7 +3302,7 @@ row_ins_sec_index_entry(
 		}
 	}
 
-	ut_ad(trx->id != 0);
+	ut_ad(thr_get_trx(thr)->id != 0);
 
 	offsets_heap = mem_heap_create(1024);
 	heap = mem_heap_create(1024);

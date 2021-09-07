@@ -3522,7 +3522,7 @@ row_merge_copy_blob_from_file(
     ut_ad(!dfield_is_null(field));
 
     ut_ad(mach_read_from_8(field_data) == 0);
-    ulint offset= mach_read_from_8(field_data + 8);
+    uint64_t offset= mach_read_from_8(field_data + 8);
     uint32_t len= mach_read_from_4(field_data + 16);
 
     byte *data= (byte*) mem_heap_alloc(heap, len);
@@ -5002,13 +5002,15 @@ row_merge_bulk_t::row_merge_bulk_t(dict_table_t *table,
     mem_heap_t *heap= mem_heap_create(100);
     row_merge_buf_create_low(&m_merge_buf[i], heap, index);
     m_merge_files[i].fd= OS_FILE_CLOSED;
-    m_merge_files[i].offset= m_merge_files[i].n_rec= 0;
+    m_merge_files[i].offset= 0;
+    m_merge_files[i].n_rec= 0;
     i++;
   }
 
   m_tmpfd= OS_FILE_CLOSED;
   m_blob_file.fd= OS_FILE_CLOSED;
-  m_blob_file.offset= m_blob_file.n_rec= 0;
+  m_blob_file.offset= 0;
+  m_blob_file.n_rec= 0;
 }
 
 row_merge_bulk_t::~row_merge_bulk_t()
