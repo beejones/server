@@ -15569,6 +15569,7 @@ ha_innobase::extra(
 		row_ins_duplicate_error_in_clust() will acquire a
 		shared lock instead of an exclusive lock. */
 	stmt_boundary:
+		trx->bulk_insert_apply();
 		trx->end_bulk_insert(*m_prebuilt->table);
 		trx->bulk_insert = false;
 		break;
