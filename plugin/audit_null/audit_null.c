@@ -16,6 +16,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335  USA */
 
 #include <stdio.h>
+#include <string.h>
 #include <mysql/plugin.h>
 #include <mysql/plugin_audit.h>
 
@@ -31,6 +32,7 @@ static volatile int ncalls; /* for SHOW STATUS, see below */
 static volatile int ncalls_general_log;
 static volatile int ncalls_general_error;
 static volatile int ncalls_general_result;
+static volatile char ncalls_last_query[100];
 
 FILE *f;
 
@@ -54,6 +56,7 @@ static int audit_null_plugin_init(void *arg __attribute__((unused)))
   ncalls_general_log= 0;
   ncalls_general_error= 0;
   ncalls_general_result= 0;
+  ncalls_last_query[0] = 0;
 
   f = fopen("audit_null_tables.log", "w");
   if (!f)
@@ -99,6 +102,7 @@ static void audit_null_notify(MYSQL_THD thd __attribute__((unused)),
 {
   /* prone to races, oh well */
   ncalls++;
+
   if (event_class == MYSQL_AUDIT_GENERAL_CLASS)
   {
     const struct mysql_event_general *event_general=
@@ -107,14 +111,20 @@ static void audit_null_notify(MYSQL_THD thd __attribute__((unused)),
     {
     case MYSQL_AUDIT_GENERAL_LOG:
       ncalls_general_log++;
-      fprintf(f, "%s\t>> %s\n", event_general->general_user,
+      if (strcmp("SHOW STATUS LIKE 'Audit_null%'", event_general->general_query) != 0) {
+        sprintf((char *)ncalls_last_query, "%s", event_general->general_query);
+      }
+
+      fprintf(f, "MYSQL_AUDIT_GENERAL_LOG->%s\t>> %s\n", event_general->general_user,
               event_general->general_query);
       break;
     case MYSQL_AUDIT_GENERAL_ERROR:
       ncalls_general_error++;
+      fprintf(f, "MYSQL_AUDIT_GENERAL_ERROR->%d\n", ncalls_general_error);
       break;
     case MYSQL_AUDIT_GENERAL_RESULT:
       ncalls_general_result++;
+      fprintf(f, "MYSQL_AUDIT_GENERAL_RESULT->%d\n", ncalls_general_result);
       break;
     default:
       break;
@@ -132,7 +142,7 @@ static void audit_null_notify(MYSQL_THD thd __attribute__((unused)),
     switch (event_table->event_subclass)
     {
     case MYSQL_AUDIT_TABLE_LOCK:
-      op= event_table->read_only ? "read" : "write";
+      op= event_table->read_only ? "lock read" : "lock write";
       break;
     case MYSQL_AUDIT_TABLE_CREATE:
       op= "create";
@@ -155,7 +165,9 @@ static void audit_null_notify(MYSQL_THD thd __attribute__((unused)),
             event_table->priv_user, event_table->user,
             event_table->host, ip,
             event_table->database.str, event_table->table.str, op);
+    
   }
+  fflush(f);
 }
 
 
@@ -179,6 +191,7 @@ static struct st_mysql_show_var simple_status[]=
   { "general_error", (char *) &ncalls_general_error, SHOW_INT },
   { "general_log", (char *) &ncalls_general_log, SHOW_INT },
   { "general_result", (char *) &ncalls_general_result, SHOW_INT },
+  { "general_last_message", (char *) ncalls_last_query, SHOW_CHAR },
   { 0, 0, 0}
 };
 
